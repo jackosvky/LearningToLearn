@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from reptile_rl.model import RNNActorCritic
-from reptile_rl.bandit_task import TwoArmedBandit
+from model import RNNActorCritic
+from bandit_task import TwoArmedBandit
 
 def collect_bandit_trajectory(
     model: RNNActorCritic,

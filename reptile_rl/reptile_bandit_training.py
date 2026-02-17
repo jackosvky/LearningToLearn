@@ -1,4 +1,7 @@
 import torch
+from bandit_task import TwoArmedBandit
+from model import RNNActorCritic
+from episode import collect_bandit_trajectory
 
 def compute_advantages(rewards, values, gamma=0.99):
     """Simple advantage: A_t = R_t - V(s_t) (no bootstrapping for bandits)."""
