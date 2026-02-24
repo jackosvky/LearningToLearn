@@ -21,8 +21,7 @@ def reptile_bandit_train(model, n_outer_iters, meta_batch_size,
         meta_weights = {name: p.data.clone() for name, p in model.named_parameters()}
         accumulated_diff = {name: torch.zeros_like(p) for name, p in model.named_parameters()}
 
-        # Sample a batch of bandit tasks
-        task_batch = [TwoArmedBandit.sample_task() for _ in range(meta_batch_size)]
+        task_batch = [TwoArmedBandit.sample_task(switch_prob=np.random.uniform(0.10, 0.90)) for _ in range(meta_batch_size)]
 
         for task in task_batch:
             # Reset to meta-parameters
@@ -37,7 +36,9 @@ def reptile_bandit_train(model, n_outer_iters, meta_batch_size,
 
                 policy_loss = -(traj['log_probs'].squeeze() * advantages).mean()
                 value_loss = torch.nn.functional.mse_loss(traj['values'].squeeze(), returns)
-                loss = policy_loss + 0.5 * value_loss
+                entropy_loss = -traj['entropies'].mean()
+                beta = 0.01  # Entropy regularization coefficient
+                loss = policy_loss + 0.5 * value_loss - beta * entropy_loss
 
                 inner_opt.zero_grad()
                 loss.backward()
@@ -184,11 +185,12 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
         hidden_state_sequences = [] if return_trajectories else None
         arm_selection_sequences = [] if return_trajectories else None
         full_reward_sequences = [] if return_trajectories else None
+        full_optimal_arm_sequences = [] if return_trajectories else None
         
         for episode in range(n_test_episodes):
+            sW_prob = np.random.uniform(0.1, 1.0)  # Randomize switch probability for more diverse testing
             # Create bandit task with specific p
-            task = TwoArmedBandit(p)
-            optimal_arm = task.optimal_arm()
+            task = TwoArmedBandit(p, switch_prob=sW_prob)
             
             # Save model state for adaptation
             if inner_steps > 0:
@@ -204,13 +206,15 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
                     
                     policy_loss = -(traj['log_probs'].squeeze() * advantages).mean()
                     value_loss = torch.nn.functional.mse_loss(traj['values'].squeeze(), returns)
-                    loss = policy_loss + 0.5 * value_loss
+                    entropy_loss = -traj['entropies'].mean()
+                    beta = 0.01  # Entropy regularization coefficient
+                    loss = policy_loss + 0.5 * value_loss - beta * entropy_loss
                     
                     inner_opt.zero_grad()
                     loss.backward()
                     inner_opt.step()
                 
-                model.eval()
+            model.eval()
             
             # Collect test trajectory
             if return_trajectories:
@@ -218,6 +222,7 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
                 hidden_states = []
                 rewards = []
                 actions = []
+                optimal_arms = []
                 
                 hidden = None
                 prev_action_onehot = torch.zeros(1, 1, task.n_arms, device=device)
@@ -225,12 +230,15 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
                 
                 with torch.no_grad():
                     for t in range(n_rounds):
+                        # Record optimal arm BEFORE the step (before potential switch)
+                        optimal_arms.append(task.optimal_arm())
+                        
                         rnn_input = torch.cat([prev_action_onehot, prev_reward], dim=-1)
                         policy_logits, value, hidden = model(rnn_input, hidden)
                         
                         action_dist = torch.distributions.Categorical(logits=policy_logits.squeeze(1))
                         action = action_dist.sample()
-                        reward = task.step(action.item())
+                        reward = task.step(action.item())  # This may trigger a switch
                         
                         hidden_states.append(hidden.detach().clone())
                         rewards.append(reward)
@@ -242,7 +250,8 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
                 traj = {
                     'rewards': torch.tensor(rewards, dtype=torch.float32, device=device),
                     'actions': actions,
-                    'hidden_states': hidden_states
+                    'hidden_states': hidden_states,
+                    'optimal_arms': optimal_arms
                 }
             else:
                 with torch.no_grad():
@@ -250,7 +259,12 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
             
             # Calculate metrics
             total_reward = traj['rewards'].sum().item()
-            optimal_choices = sum(1 for a in traj['actions'] if a == optimal_arm)
+            if return_trajectories:
+                optimal_choices = sum(1 for a, o in zip(traj['actions'], traj['optimal_arms']) if a == o)
+            else:
+                # For non-trajectory mode, get initial optimal arm (no switching info available)
+                initial_optimal_arm = 0 if p >= 0.5 else 1
+                optimal_choices = sum(1 for a in traj['actions'] if a == initial_optimal_arm)
             optimal_freq = optimal_choices / n_rounds
             
             episode_rewards.append(total_reward)
@@ -261,6 +275,7 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
                 hidden_state_sequences.append(torch.stack(traj['hidden_states']))  # (n_rounds, 1, hidden_size)
                 arm_selection_sequences.append(traj['actions'])
                 full_reward_sequences.append(traj['rewards'].cpu().numpy())
+                full_optimal_arm_sequences.append(traj['optimal_arms'])
             
             # Restore model weights if we did adaptation
             if inner_steps > 0:
@@ -286,12 +301,14 @@ def test_model_performance(model, p_values, n_test_episodes=10, n_rounds=50,
             results[p]['hidden_states'] = hidden_state_sequences  # List of (n_rounds, 1, hidden_size)
             results[p]['arm_selections'] = arm_selection_sequences  # List of action sequences
             results[p]['episode_rewards'] = full_reward_sequences  # List of reward sequences
+            results[p]['optimal_arms'] = full_optimal_arm_sequences  # List of optimal arm sequences
         
         # Print results
-        print(f"\np = {p:.2f} (Optimal arm: {task.optimal_arm()}, Expected reward: {max(p, 1-p):.2f})")
+        print(f"\np = {p:.2f} (Switch prob: {sW_prob:.2f}, Expected reward with switches: variable)")
         print(f"  Avg Reward: {avg_reward:.2f} ± {std_reward:.2f} (out of {n_rounds})")
         print(f"  Avg Optimal Arm Selection: {avg_optimal_freq*100:.1f}% ± {std_optimal_freq*100:.1f}%")
-        print(f"  Efficiency: {(avg_reward / results[p]['max_possible_reward'])*100:.1f}%")
+        max_reward = n_rounds * max(p, 1-p)
+        print(f"  Efficiency (vs static max): {(avg_reward / max_reward)*100:.1f}%")
     
     print("\n" + "="*60)
     print("SUMMARY")
